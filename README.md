@@ -1,23 +1,121 @@
 # FlowtoAgent — ZIP-to-Weather Multi-Stage Agent
 
-A production-ready Python agent built with the Anthropic Claude API that converts a US ZIP code into a live weather forecast through a three-stage tool-use pipeline. Designed as a reference implementation for token-optimized, self-healing, observable Claude agents.
+A production-ready Python agent built with the Anthropic Claude API that converts a US ZIP code into a live weather forecast through a three-stage tool-use pipeline.
 
 ---
 
-## How It Works
+## How This Agent Was Built
+
+This project was built entirely through a Claude Code session — from a hand-drawn workflow diagram to a tested, documented, and published agent. Here's how the process worked.
+
+### Step 1 — Design First, Code Second
+
+The build started with a workflow diagram created in [Excalidraw](https://excalidraw.com). Both the diagram image and its underlying JSON were provided to Claude Code as the design specification.
+
+```
+Excalidraw JSON + Image
+        │
+        ▼
+  Claude Code reads the diagram
+  and scopes out the implementation
+```
+
+The diagram defined:
+- Three sequential stages (validate → geocode → forecast)
+- Gate conditions at each stage (what stops the pipeline early)
+- The decision logic for re-prompting vs reporting errors
+
+No written spec was required — the visual diagram was sufficient input to generate the full implementation plan.
+
+### Step 2 — Planning with Constraints
+
+Before any code was written, the plan went through two rounds of feedback:
+
+**Round 1 — Token optimization:**
+> *"Plan to be effective in the API calls. Objective is to minimize token consumption while being functionally complete."*
+
+This drove the key architectural decisions:
+- Switch from `claude-opus-4-6` to `claude-haiku-4-5` (5× cheaper)
+- Disable adaptive thinking entirely (not needed for tool routing)
+- Cap `max_tokens` at 512
+- Write lean tool schemas (1-sentence descriptions, minimum required fields)
+- Return only essential fields from each tool implementation
+
+**Round 2 — Reliability and observability:**
+> *"Include performance metrics as timing and resource consumption. The agents must be self-healing."*
+
+This added:
+- A `Metrics` dataclass tracking per-stage timing, token counts, retry counts, and estimated cost
+- HTTP retry with exponential backoff on transient errors
+- Anthropic API retry respecting `retry-after` headers
+- Tools that never raise — returning `{"error": "..."}` dicts instead so Claude handles failures gracefully
+
+### Step 3 — Implementation
+
+With the plan approved, `agent.py` was generated in a single pass (~375 lines). The final architecture:
+
+| Layer | What it does |
+|---|---|
+| Constants | Model, max_tokens, system prompt, tool schemas |
+| Metrics | Per-run observability dataclass |
+| Self-healing | HTTP retry + Anthropic API retry helpers |
+| Tools | `validate_zip`, `zipgeocode`, `grid_finder` |
+| Dispatch | Tool router that never raises |
+| Agentic loop | Manual `tool_use` loop with stage gates |
+| Main | Input loop, metrics print, re-prompt logic |
+
+### Step 4 — Test Before Release
+
+A replan was requested before the code was considered released:
+
+> *"Replan. Include testing of the valid path and other failure scenarios. Perform the testing before releasing."*
+
+`test_agent.py` was written with **32 unit tests** across 6 test classes using only `unittest` and `unittest.mock` — no additional dependencies. All external I/O (HTTP calls, Anthropic API) is mocked so tests run in under 0.1 seconds with no API key required.
+
+```bash
+python -m unittest test_agent.py -v
+# Ran 32 tests in 0.058s
+# OK
+```
+
+All 32 tests passed on the first run with no changes needed to `agent.py`. The agent was then considered released.
+
+### Step 5 — Live Validation
+
+The agent was then run against real network calls to validate end-to-end behavior. A Windows console encoding issue surfaced (Claude's response contained emoji that `cp1252` couldn't encode) and was fixed by adding a stdout reconfigure at startup.
+
+```
+Stage 1 — validate_zip  :      0.1 ms  (local regex)
+Stage 2 — zipgeocode    :     41.3 ms  (zippopotam.us)
+Stage 3 — grid_finder   :  1,217.8 ms  (2 × api.weather.gov)
+Total cost per run      :    ~$0.006
+```
+
+### Step 6 — Documentation and SOP
+
+Two documents were generated to make this pattern reusable:
+
+- **`SOP_Anthropic_Tool_Use_Agent.md`** — A 10-step standard operating procedure for building future agents with the same architecture
+- **Claude Code skill** — A persistent skill file (`/anthropic-tool-use-agent`) saved to the local Claude Code environment so the pattern auto-loads in future sessions
+
+---
+
+## What the Agent Does
+
+Converts a US ZIP code into a live NWS weather forecast through a three-stage Claude tool-use pipeline.
 
 ```
 User enters ZIP code
         │
         ▼
 ┌─────────────────────┐
-│  STAGE 1            │  validate_zip (local regex)
+│  STAGE 1            │  validate_zip  (local regex)
 │  ZIP Validation     │──── invalid ──▶ re-prompt user
 └────────┬────────────┘
          │ valid
          ▼
 ┌─────────────────────┐
-│  STAGE 2            │  zipgeocode → zippopotam.us API
+│  STAGE 2            │  zipgeocode → zippopotam.us
 │  Geocoding          │──── error ───▶ Claude reports, stops
 └────────┬────────────┘
          │ city, state, lat/lon
@@ -31,8 +129,6 @@ User enters ZIP code
   Claude formats and
   presents the forecast
 ```
-
-Claude orchestrates the tool calls in sequence. Each stage is a gate — failure stops the pipeline and surfaces a clear error message rather than continuing with bad data.
 
 ---
 
@@ -88,39 +184,29 @@ Coordinates: 34.0901° N, -118.4065° W
 
 ## Architecture
 
-### Model Choice
-Uses `claude-haiku-4-5` — the fastest and most cost-efficient Claude model. Tool routing does not require deep reasoning, so Opus/Sonnet would be wasteful. No thinking/extended reasoning enabled.
+### Model and settings
 
 | Setting | Value | Reason |
 |---|---|---|
 | Model | `claude-haiku-4-5` | $1/$5 per 1M tokens — 5× cheaper than Sonnet |
-| `max_tokens` | 512 | Caps output; tool routing + summary fits comfortably |
+| `max_tokens` | 512 | Tool routing + summary fits comfortably |
 | Thinking | Disabled | Not needed for structured tool orchestration |
 
-### External APIs (all free, no key required)
+### External APIs (free, no key required)
 
 | API | Purpose | Endpoint |
 |---|---|---|
 | [zippopotam.us](http://api.zippopotam.us) | ZIP → lat/lon, city, state | `GET /us/{zip}` |
-| [api.weather.gov](https://www.weather.gov/documentation/services-web-api) | Grid lookup + forecast | `GET /points/{lat},{lon}` + `GET /gridpoints/{office}/{x},{y}/forecast` |
+| [api.weather.gov](https://www.weather.gov/documentation/services-web-api) | Grid lookup | `GET /points/{lat},{lon}` |
+| [api.weather.gov](https://www.weather.gov/documentation/services-web-api) | Forecast | `GET /gridpoints/{office}/{x},{y}/forecast` |
 
-### Self-Healing (3 layers)
+### Self-healing (3 layers)
 
-1. **HTTP retry** — exponential backoff (1s → 2s → 4s, max 10s) on `429, 500, 502, 503, 504` and `ConnectionError`
-2. **Anthropic API retry** — respects `retry-after` header on rate limits; backs off on server errors
-3. **Claude-driven error propagation** — tools never raise; they return `{"error": "..."}` dicts that Claude reads and reports to the user
-
-### Observability
-
-A `Metrics` dataclass tracks per-run:
-- Per-stage wall-clock timing (ms)
-- Anthropic API call count
-- Input/output token counts
-- Estimated cost (USD)
-- Total elapsed time
-- Retry count
-
-Printed after every run, success or failure.
+| Layer | Mechanism |
+|---|---|
+| HTTP | Exponential backoff (1s → 2s → 4s) on `429, 500, 502, 503, 504` and `ConnectionError` |
+| Anthropic API | Respects `retry-after` header on rate limits; backs off on server errors |
+| Claude | Tools return `{"error": "..."}` dicts — Claude reads and reports, never silently fails |
 
 ---
 
@@ -131,18 +217,14 @@ FlowtoAgent/
 ├── agent.py                         # Agent implementation (~375 lines)
 ├── test_agent.py                    # 32 unit tests, stdlib only
 ├── requirements.txt                 # Runtime dependencies
-└── SOP_Anthropic_Tool_Use_Agent.md  # 10-step build guide / reuse SOP
+└── SOP_Anthropic_Tool_Use_Agent.md  # 10-step build guide for reuse
 ```
 
 ---
 
 ## Setup
 
-### Prerequisites
-- Python 3.10+
-- An [Anthropic API key](https://console.anthropic.com/settings/keys)
-
-### Install
+**Prerequisites:** Python 3.10+, an [Anthropic API key](https://console.anthropic.com/settings/keys)
 
 ```bash
 git clone https://github.com/cloudorcl-lab/FlowtoAgent.git
@@ -150,16 +232,14 @@ cd FlowtoAgent
 pip install -r requirements.txt
 ```
 
-### Run
+**Run:**
 
 ```bash
+# macOS / Linux
 export ANTHROPIC_API_KEY=sk-ant-...
 python agent.py
-```
 
-On Windows:
-
-```cmd
+# Windows
 set ANTHROPIC_API_KEY=sk-ant-...
 python agent.py
 ```
@@ -174,87 +254,20 @@ No API key required — all external I/O is mocked.
 python -m unittest test_agent.py -v
 ```
 
-Expected output:
-
-```
-TestDispatchTool.test_tool_exception_caught ... ok
-TestDispatchTool.test_unknown_tool ... ok
-TestDispatchTool.test_valid_tool_validate_zip ... ok
-TestGridFinder.test_forecast_500 ... ok
-TestGridFinder.test_forecast_network_error ... ok
-TestGridFinder.test_forecast_truncated_to_2 ... ok
-TestGridFinder.test_nws_404 ... ok
-TestGridFinder.test_nws_422_offshore ... ok
-TestGridFinder.test_points_network_error ... ok
-TestGridFinder.test_success ... ok
-TestHttpGetWithRetry.test_exhausts_retries_raises ... ok
-TestHttpGetWithRetry.test_increments_metrics_retries ... ok
-TestHttpGetWithRetry.test_non_retryable_400_no_retry ... ok
-TestHttpGetWithRetry.test_retries_on_500_then_succeeds ... ok
-TestHttpGetWithRetry.test_retries_on_connection_error_then_succeeds ... ok
-TestHttpGetWithRetry.test_success_first_try ... ok
-TestRunAgent.test_geocode_error_returns_true ... ok
-TestRunAgent.test_happy_path_returns_true ... ok
-TestRunAgent.test_invalid_zip_returns_false ... ok
-TestRunAgent.test_metrics_populated ... ok
-TestValidateZip.test_invalid_empty ... ok
-TestValidateZip.test_invalid_letters ... ok
-TestValidateZip.test_invalid_too_long ... ok
-TestValidateZip.test_invalid_too_short ... ok
-TestValidateZip.test_invalid_with_spaces ... ok
-TestValidateZip.test_valid_5digit ... ok
-TestValidateZip.test_valid_nyc ... ok
-TestZipgeocode.test_malformed_response ... ok
-TestZipgeocode.test_network_timeout ... ok
-TestZipgeocode.test_service_error ... ok
-TestZipgeocode.test_success ... ok
-TestZipgeocode.test_zip_not_found ... ok
-
-Ran 32 tests in 0.058s
-
-OK
-```
-
-### Test coverage
-
-| Class | Scenarios |
+| Test class | Coverage |
 |---|---|
-| `TestValidateZip` | Valid, invalid (letters, too short, too long, empty, spaces) |
-| `TestZipgeocode` | Success, 404, 500, network error, malformed JSON |
-| `TestGridFinder` | Success, 422 offshore, 404, points error, forecast error, 500, 2-period truncation |
-| `TestHttpGetWithRetry` | First try, retry→success, ConnectionError→success, exhausted, no-retry 400, metrics counter |
-| `TestDispatchTool` | Valid tool, unknown tool, exception containment |
-| `TestRunAgent` | Happy path, invalid ZIP, geocode error, metrics populated |
+| `TestValidateZip` | Valid, invalid letters/length/empty/spaces (7 tests) |
+| `TestZipgeocode` | Success, 404, 500, network error, malformed JSON (5 tests) |
+| `TestGridFinder` | Success, 422 offshore, 404, points/forecast errors, 500, truncation (7 tests) |
+| `TestHttpGetWithRetry` | First-try, retry→success, exhausted retries, no-retry 400, metrics (6 tests) |
+| `TestDispatchTool` | Valid tool, unknown tool, exception containment (3 tests) |
+| `TestRunAgent` | Happy path, invalid ZIP, tool error, metrics populated (4 tests) |
 
 ---
 
-## Reuse as a Template
+## Reusing This Pattern
 
-`SOP_Anthropic_Tool_Use_Agent.md` is a 10-step build guide for creating new agents with this same pattern:
-
-1. Design the workflow (stages + gates + failure modes)
-2. Choose model
-3. Write constants (system prompt + tool schemas)
-4. Implement `Metrics`
-5. Implement self-healing HTTP + Anthropic helpers
-6. Implement tools (never raise — return error dicts)
-7. Implement the agentic loop
-8. Implement `main()`
-9. Write the test suite
-10. Run tests → release
-
----
-
-## Cost Estimate
-
-| Component | Tokens |
-|---|---|
-| System prompt + tool schemas | ~300 |
-| Conversation history per run | ~400 |
-| Tool call responses × 3 | ~200 |
-| Claude output (routing + summary) | ~190 |
-| **Total per run** | **~1,100–1,400** |
-| **Cost at Haiku rates** | **~$0.002–$0.006** |
+`SOP_Anthropic_Tool_Use_Agent.md` is a 10-step build guide for creating new agents with this same architecture — from workflow diagram to tested release. The pattern is designed to work for any multi-stage tool-use agent that calls external APIs through Claude.
 
 ---
 
