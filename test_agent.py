@@ -2,7 +2,7 @@
 test_agent.py — Full test suite for agent.py
 
 Covers: valid path (happy path) and all failure scenarios.
-No real HTTP or Anthropic API calls — all external I/O is mocked.
+No real HTTP or LLM API calls — all external I/O is mocked.
 
 Run: python -m unittest test_agent.py -v
 """
@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
+from llm_provider import LLMResponse, LLMUsage, ToolCall
 from agent import (
     validate_zip,
     zipgeocode,
@@ -86,32 +87,76 @@ def make_mock_response(status_code, json_data=None):
     return mock
 
 
-# ── Mock Claude response helpers ──────────────────────────────────────────────
+# ── MockProvider ──────────────────────────────────────────────────────────────
 
-class MockUsage:
-    input_tokens = 100
-    output_tokens = 30
+class MockProvider:
+    """
+    Test double for LLMProvider.
+    Feed pre-built LLMResponse objects via the responses list.
+    Implements the same interface as LLMProvider without ABC overhead.
+    """
+
+    def __init__(self, responses):
+        self._responses = iter(responses)
+
+    def chat(self, messages, tools, system=""):
+        return next(self._responses)
+
+    def format_assistant_message(self, response):
+        return {"role": "assistant", "content": ""}
+
+    def format_tool_messages(self, tool_calls, results):
+        return [{"role": "user", "content": results}]
+
+    def convert_tools(self, tools):
+        return tools
 
 
-class MockToolUseBlock:
-    def __init__(self, name, input_dict, block_id="tu_001"):
-        self.type = "tool_use"
-        self.name = name
-        self.input = input_dict
-        self.id = block_id
+def make_tool_response(tool_calls_data, in_tok=100, out_tok=30):
+    """Build an LLMResponse with stop_reason='tool_use'."""
+    tcs = [
+        ToolCall(id=d["id"], name=d["name"], input=d["input"])
+        for d in tool_calls_data
+    ]
+    return LLMResponse(
+        stop_reason="tool_use",
+        tool_calls=tcs,
+        text="",
+        usage=LLMUsage(input_tokens=in_tok, output_tokens=out_tok),
+        raw=None,
+    )
 
 
-class MockTextBlock:
-    type = "text"
-    def __init__(self, text="Done."):
-        self.text = text
+def make_text_response(text="Done.", in_tok=100, out_tok=30):
+    """Build an LLMResponse with stop_reason='end_turn'."""
+    return LLMResponse(
+        stop_reason="end_turn",
+        tool_calls=[],
+        text=text,
+        usage=LLMUsage(input_tokens=in_tok, output_tokens=out_tok),
+        raw=None,
+    )
 
 
-class MockResponse:
-    def __init__(self, stop_reason, content):
-        self.stop_reason = stop_reason
-        self.content = content
-        self.usage = MockUsage()
+# ── Happy path response sequence ──────────────────────────────────────────────
+
+_FORECAST_DATA = [
+    {"period": "Tonight", "temp": "62F", "wind": "5 mph W", "summary": "Clear"},
+    {"period": "Wednesday", "temp": "72F", "wind": "10 mph SW", "summary": "Sunny"},
+]
+
+_HAPPY_RESPONSES = [
+    make_tool_response([{"id": "tu_1", "name": "validate_zip", "input": {"zip_code": "90210"}}]),
+    make_tool_response([{"id": "tu_2", "name": "zipgeocode",   "input": {"zip_code": "90210"}}]),
+    make_tool_response([{"id": "tu_3", "name": "grid_finder",  "input": {"latitude": "34.09", "longitude": "-118.40"}}]),
+    make_text_response("Tonight: Clear 62F. Wednesday: Sunny 72F."),
+]
+
+_DISPATCH_HAPPY = [
+    json.dumps({"is_valid": True}),
+    json.dumps({"city": "Beverly Hills", "state": "CA", "lat": "34.09", "lon": "-118.40"}),
+    json.dumps({"location": "Beverly Hills, CA", "forecast": _FORECAST_DATA}),
+]
 
 
 # ── 1. TestValidateZip ────────────────────────────────────────────────────────
@@ -363,76 +408,46 @@ class TestDispatchTool(unittest.TestCase):
 
 # ── 6. TestRunAgent ───────────────────────────────────────────────────────────
 
-_FORECAST_DATA = [
-    {"period": "Tonight", "temp": "62F", "wind": "5 mph W", "summary": "Clear"},
-    {"period": "Wednesday", "temp": "72F", "wind": "10 mph SW", "summary": "Sunny"},
-]
-
-_DISPATCH_HAPPY = [
-    json.dumps({"is_valid": True}),
-    json.dumps({"city": "Beverly Hills", "state": "CA", "lat": "34.09", "lon": "-118.40"}),
-    json.dumps({"location": "Beverly Hills, CA", "forecast": _FORECAST_DATA}),
-]
-
-
 class TestRunAgent(unittest.TestCase):
 
-    def _client(self):
-        return MagicMock()
-
     @patch("agent.dispatch_tool")
-    @patch("agent.claude_create_with_retry")
-    def test_happy_path_returns_true(self, mock_claude, mock_dispatch):
+    def test_happy_path_returns_true(self, mock_dispatch):
         mock_dispatch.side_effect = list(_DISPATCH_HAPPY)
-        mock_claude.side_effect = [
-            MockResponse("tool_use", [MockToolUseBlock("validate_zip", {"zip_code": "90210"}, "tu_1")]),
-            MockResponse("tool_use", [MockToolUseBlock("zipgeocode",   {"zip_code": "90210"}, "tu_2")]),
-            MockResponse("tool_use", [MockToolUseBlock("grid_finder",  {"latitude": "34.09", "longitude": "-118.40"}, "tu_3")]),
-            MockResponse("end_turn", [MockTextBlock("Tonight: Clear 62F. Wednesday: Sunny 72F.")]),
-        ]
-        self.assertTrue(run_agent(self._client(), "90210", Metrics()))
+        provider = MockProvider(list(_HAPPY_RESPONSES))
+        self.assertTrue(run_agent(provider, "90210", Metrics()))
 
     @patch("agent.dispatch_tool")
-    @patch("agent.claude_create_with_retry")
-    def test_invalid_zip_returns_false(self, mock_claude, mock_dispatch):
+    def test_invalid_zip_returns_false(self, mock_dispatch):
         mock_dispatch.return_value = json.dumps({"is_valid": False, "reason": "Must be exactly 5 digits"})
-        mock_claude.return_value = MockResponse(
-            "tool_use",
-            [MockToolUseBlock("validate_zip", {"zip_code": "abc"}, "tu_1")]
-        )
-        self.assertFalse(run_agent(self._client(), "abc", Metrics()))
+        provider = MockProvider([
+            make_tool_response([{"id": "tu_1", "name": "validate_zip", "input": {"zip_code": "abc"}}]),
+        ])
+        self.assertFalse(run_agent(provider, "abc", Metrics()))
 
     @patch("agent.dispatch_tool")
-    @patch("agent.claude_create_with_retry")
-    def test_geocode_error_returns_true(self, mock_claude, mock_dispatch):
-        """When geocoding fails, Claude reports the error at end_turn; run_agent returns True."""
+    def test_geocode_error_returns_true(self, mock_dispatch):
+        """When geocoding fails, model reports the error at end_turn; run_agent returns True."""
         mock_dispatch.side_effect = [
             json.dumps({"is_valid": True}),
             json.dumps({"error": "ZIP 00000 not found in database."}),
         ]
-        mock_claude.side_effect = [
-            MockResponse("tool_use", [MockToolUseBlock("validate_zip", {"zip_code": "00000"}, "tu_1")]),
-            MockResponse("tool_use", [MockToolUseBlock("zipgeocode",   {"zip_code": "00000"}, "tu_2")]),
-            MockResponse("end_turn", [MockTextBlock("Sorry, ZIP 00000 was not found.")]),
-        ]
-        self.assertTrue(run_agent(self._client(), "00000", Metrics()))
+        provider = MockProvider([
+            make_tool_response([{"id": "tu_1", "name": "validate_zip", "input": {"zip_code": "00000"}}]),
+            make_tool_response([{"id": "tu_2", "name": "zipgeocode",   "input": {"zip_code": "00000"}}]),
+            make_text_response("Sorry, ZIP 00000 was not found."),
+        ])
+        self.assertTrue(run_agent(provider, "00000", Metrics()))
 
     @patch("agent.dispatch_tool")
-    @patch("agent.claude_create_with_retry")
-    def test_metrics_populated(self, mock_claude, mock_dispatch):
+    def test_metrics_populated(self, mock_dispatch):
         """API call count and token totals must be accumulated across all 4 turns."""
         mock_dispatch.side_effect = list(_DISPATCH_HAPPY)
-        mock_claude.side_effect = [
-            MockResponse("tool_use", [MockToolUseBlock("validate_zip", {"zip_code": "90210"}, "tu_1")]),
-            MockResponse("tool_use", [MockToolUseBlock("zipgeocode",   {"zip_code": "90210"}, "tu_2")]),
-            MockResponse("tool_use", [MockToolUseBlock("grid_finder",  {"latitude": "34.09", "longitude": "-118.40"}, "tu_3")]),
-            MockResponse("end_turn", [MockTextBlock("Forecast ready.")]),
-        ]
+        provider = MockProvider(list(_HAPPY_RESPONSES))
         m = Metrics()
-        run_agent(self._client(), "90210", m)
+        run_agent(provider, "90210", m)
         self.assertEqual(m.api_calls, 4)
-        self.assertEqual(m.input_tokens,  4 * MockUsage.input_tokens)
-        self.assertEqual(m.output_tokens, 4 * MockUsage.output_tokens)
+        self.assertEqual(m.input_tokens,  4 * 100)   # 100 per MockResponse
+        self.assertEqual(m.output_tokens, 4 * 30)    # 30 per MockResponse
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

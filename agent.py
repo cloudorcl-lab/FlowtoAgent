@@ -5,8 +5,9 @@ Stage 1: Validate ZIP via LLM
 Stage 2: Geocode ZIP to lat/lon (zippopotam.us)
 Stage 3: Fetch NWS weather forecast (api.weather.gov)
 
-Self-healing: HTTP retries with exponential backoff, Anthropic API retries.
+Self-healing: HTTP retries with exponential backoff, LLM API retries.
 Metrics: per-stage timing, token usage, estimated cost.
+Provider: any LLM with tool/function calling (Claude, OpenAI, Gemini).
 """
 
 import json
@@ -16,13 +17,12 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-import anthropic
 import requests
+
+from llm_provider import LLMProvider, LLMUsage, create_provider
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MODEL      = os.environ.get("ANTHROPIC_MODEL",      "claude-haiku-4-5")
-MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "512"))
 NWS_HEADERS = {"User-Agent": "ZIPWeather/1.0 (weather-agent)"}
 
 SYSTEM_PROMPT = (
@@ -87,15 +87,16 @@ class Metrics:
     def record_stage(self, tool_name: str, elapsed_ms: float):
         self.stage_times[tool_name] = elapsed_ms
 
-    def record_response(self, response):
+    def record_usage(self, usage: LLMUsage):
         self.api_calls += 1
-        self.input_tokens += response.usage.input_tokens
-        self.output_tokens += response.usage.output_tokens
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
 
     def total_elapsed_ms(self) -> float:
         return (time.time() - self.start_time) * 1000
 
     def estimated_cost_usd(self) -> float:
+        # Approximate cost based on haiku-4-5 rates ($1/$5 per 1M tokens)
         return (self.input_tokens * 1e-6) + (self.output_tokens * 5e-6)
 
     def print_summary(self):
@@ -113,7 +114,7 @@ class Metrics:
             for key, ms in self.stage_times.items():
                 label = labels.get(key, key)
                 print(f"   {label} : {ms:>8.1f} ms")
-        print(f"\n Anthropic API calls : {self.api_calls}")
+        print(f"\n LLM API calls       : {self.api_calls}")
         print(f" Input tokens        : {self.input_tokens:,}")
         print(f" Output tokens       : {self.output_tokens:,}")
         print(f" Estimated cost      : ${self.estimated_cost_usd():.4f}")
@@ -122,7 +123,7 @@ class Metrics:
         print(bar)
 
 
-# ── Self-Healing Helpers ──────────────────────────────────────────────────────
+# ── Self-Healing HTTP ──────────────────────────────────────────────────────────
 
 def http_get_with_retry(
     url: str,
@@ -151,29 +152,6 @@ def http_get_with_retry(
                 time.sleep(wait)
             else:
                 raise
-
-
-def claude_create_with_retry(client: anthropic.Anthropic, max_retries: int = 3, metrics: Metrics = None, **kwargs):
-    """Call client.messages.create with retry on rate-limit and server errors."""
-    for attempt in range(max_retries):
-        try:
-            return client.messages.create(**kwargs)
-        except anthropic.RateLimitError as e:
-            if attempt < max_retries - 1:
-                wait = int(getattr(e.response, "headers", {}).get("retry-after", 2 ** attempt))
-                if metrics:
-                    metrics.retries += 1
-                time.sleep(min(wait, 30))
-            else:
-                raise
-        except anthropic.InternalServerError:
-            if attempt < max_retries - 1:
-                if metrics:
-                    metrics.retries += 1
-                time.sleep(2 ** attempt)
-            else:
-                raise
-    raise RuntimeError("Claude API unavailable after retries")
 
 
 # ── Tool Implementations ──────────────────────────────────────────────────────
@@ -216,7 +194,7 @@ def grid_finder(latitude: str, longitude: str, metrics: Metrics = None) -> dict:
     except requests.RequestException:
         return {"error": "NWS weather service unavailable. Try again later."}
 
-    if resp.status_code == 404 or resp.status_code == 422:
+    if resp.status_code in (404, 422):
         return {"error": "Location not supported by NWS (offshore or non-US?)."}
     if resp.status_code != 200:
         return {"error": f"NWS points API error (HTTP {resp.status_code}). Try again later."}
@@ -244,10 +222,10 @@ def grid_finder(latitude: str, longitude: str, metrics: Metrics = None) -> dict:
         periods = resp2.json()["properties"]["periods"][:2]
         forecast = [
             {
-                "period":   p["name"],
-                "temp":     f"{p['temperature']}{p['temperatureUnit']}",
-                "wind":     f"{p['windSpeed']} {p['windDirection']}",
-                "summary":  p["shortForecast"],
+                "period":  p["name"],
+                "temp":    f"{p['temperature']}{p['temperatureUnit']}",
+                "wind":    f"{p['windSpeed']} {p['windDirection']}",
+                "summary": p["shortForecast"],
             }
             for p in periods
         ]
@@ -279,7 +257,7 @@ def dispatch_tool(name: str, tool_input: dict, metrics: Metrics) -> str:
 
 # ── Agentic Loop ──────────────────────────────────────────────────────────────
 
-def run_agent(client: anthropic.Anthropic, zip_input: str, metrics: Metrics) -> bool:
+def run_agent(provider: LLMProvider, zip_input: str, metrics: Metrics) -> bool:
     """
     Run one complete lookup attempt.
     Returns True on success (forecast shown), False if ZIP invalid (re-prompt).
@@ -287,56 +265,42 @@ def run_agent(client: anthropic.Anthropic, zip_input: str, metrics: Metrics) -> 
     messages = [{"role": "user", "content": f"Weather for ZIP {zip_input}"}]
 
     while True:
-        response = claude_create_with_retry(
-            client,
-            metrics=metrics,
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
-        metrics.record_response(response)
-        messages.append({"role": "assistant", "content": response.content})
+        response = provider.chat(messages, TOOLS, SYSTEM_PROMPT)
+        metrics.record_usage(response.usage)
+        messages.append(provider.format_assistant_message(response))
 
         if response.stop_reason == "tool_use":
             tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(STAGE_HEADERS.get(block.name, f"\n=== {block.name.upper()} ==="))
-                    t0 = time.time()
-                    result_str = dispatch_tool(block.name, block.input, metrics)
-                    elapsed_ms = (time.time() - t0) * 1000
-                    metrics.record_stage(block.name, elapsed_ms)
+            for tc in response.tool_calls:
+                print(STAGE_HEADERS.get(tc.name, f"\n=== {tc.name.upper()} ==="))
+                t0 = time.time()
+                result_str = dispatch_tool(tc.name, tc.input, metrics)
+                elapsed_ms = (time.time() - t0) * 1000
+                metrics.record_stage(tc.name, elapsed_ms)
 
-                    result_dict = json.loads(result_str)
+                result_dict = json.loads(result_str)
 
-                    # Stage 1 gate — fail-fast on invalid ZIP
-                    if block.name == "validate_zip" and not result_dict.get("is_valid"):
-                        print(f"  Invalid ZIP: {result_dict.get('reason', 'Unknown reason')}")
-                        return False
+                # Stage 1 gate — fail-fast on invalid ZIP
+                if tc.name == "validate_zip" and not result_dict.get("is_valid"):
+                    print(f"  Invalid ZIP: {result_dict.get('reason', 'Unknown reason')}")
+                    return False
 
-                    # Show tool output summary
-                    if "error" not in result_dict:
-                        if block.name == "zipgeocode":
-                            print(f"  {result_dict.get('city')}, {result_dict.get('state')} "
-                                  f"({result_dict.get('lat')}, {result_dict.get('lon')})")
-                        elif block.name == "grid_finder":
-                            print(f"  Location: {result_dict.get('location')}")
+                # Show tool output summary
+                if "error" not in result_dict:
+                    if tc.name == "zipgeocode":
+                        print(f"  {result_dict.get('city')}, {result_dict.get('state')} "
+                              f"({result_dict.get('lat')}, {result_dict.get('lon')})")
+                    elif tc.name == "grid_finder":
+                        print(f"  Location: {result_dict.get('location')}")
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_str,
-                    })
+                tool_results.append(result_str)
 
-            messages.append({"role": "user", "content": tool_results})
+            messages.extend(provider.format_tool_messages(response.tool_calls, tool_results))
 
         else:
-            # end_turn — print Claude's final summary
-            for block in response.content:
-                if hasattr(block, "text") and block.text:
-                    print(f"\n{block.text}")
+            # end_turn — print final text
+            if response.text:
+                print(f"\n{response.text}")
             return True
 
 
@@ -346,16 +310,15 @@ def main():
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("Error: ANTHROPIC_API_KEY environment variable not set.")
-        print("       Copy .env.example to .env and fill in your key.")
+    try:
+        provider = create_provider()
+    except ValueError as e:
+        print(f"Error: {e}")
+        print("       Copy .env.example to .env and fill in your API key.")
         return
 
-    print(f"Model      : {MODEL}")
-    print(f"Max tokens : {MAX_TOKENS}")
-    client = anthropic.Anthropic(api_key=api_key)
-
+    provider_name = os.environ.get("LLM_PROVIDER", "claude")
+    print(f"Provider   : {provider_name}")
     print("ZIP-to-Weather Agent")
     print("=" * 38)
 
@@ -366,7 +329,7 @@ def main():
             break
 
         metrics = Metrics()
-        success = run_agent(client, zip_input, metrics)
+        success = run_agent(provider, zip_input, metrics)
         metrics.print_summary()
 
         if success:

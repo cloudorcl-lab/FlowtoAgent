@@ -1,2 +1,14 @@
+# Runtime dependencies — install all for full provider support
+# Minimum: install only the provider you intend to use
+
+# Required for LLM_PROVIDER=claude (default)
 anthropic>=0.25.0
+
+# Required for all providers — HTTP retry for tool calls
 requests>=2.31.0
+
+# Optional: LLM_PROVIDER=openai
+# openai>=1.0.0
+
+# Optional: LLM_PROVIDER=gemini
+# google-generativeai>=0.5.0
