@@ -21,8 +21,8 @@ import requests
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 512
+MODEL      = os.environ.get("ANTHROPIC_MODEL",      "claude-haiku-4-5")
+MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "512"))
 NWS_HEADERS = {"User-Agent": "ZIPWeather/1.0 (weather-agent)"}
 
 SYSTEM_PROMPT = (
@@ -349,8 +349,11 @@ def main():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("Error: ANTHROPIC_API_KEY environment variable not set.")
+        print("       Copy .env.example to .env and fill in your key.")
         return
 
+    print(f"Model      : {MODEL}")
+    print(f"Max tokens : {MAX_TOKENS}")
     client = anthropic.Anthropic(api_key=api_key)
 
     print("ZIP-to-Weather Agent")
